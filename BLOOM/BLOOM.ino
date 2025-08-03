@@ -3,14 +3,47 @@
  * Licensed under the MIT License.
  * See LICENSE file in the project root for full license information.
  */
- 
- #include <HardwareSerial.h>
+
+#include <HardwareSerial.h>
+#include <WiFi.h>
+#include <time.h>
+#include <esp_sntp.h>
+#include <PubSubClient.h>
+#include <credentials.h>
+
+// credentials.h
+const char* ssid = SSID;
+const char* WiFiPw = WIFI_PW;
+const char* HostName = "BLOOM";
+const char* MQTTserver = MQTT_SERVER;
+const char* MQTTuser = MQTT_USER;
+const char* MQTTpw = MQTT_PW;
+
+
+// Control conectivity
+const bool connectivity = true;
+const int maxNumberOfTries = 9;
+int WiFiTry = 0;
+int MQTTTry = 0;
+
+
+WiFiClient espClient;
+PubSubClient MQTTclient(espClient);
+
+// NTP settings
+const char* ntpServer1 = "pool.ntp.org";
+const char* ntpServer2 = "time.nist.gov";
+const long gmtOffset_sec = 3600;
+const int daylightOffset_sec = 3600;
+char timeStr[64];  // Could be less
+
 
 // RS485/Modbus
 HardwareSerial RS485Serial(1);
 const int RS485_DIR = 4;
 const int RS485_RX = 20;
 const int RS485_TX = 21;
+const int RS485_BAUD = 9600;
 
 // Pins
 const int ledPin = 1;
@@ -22,13 +55,20 @@ const int GPIO7 = 7;
 const int GPIO10 = 10;
 
 // RUN-indication (blinking LED)
+bool runIndication = false;
 unsigned long prevBlink = 0;
-const int blinkInterval = 2000;
+const int blinkInterval = 1800000;
 bool ledState = false;
+
+// Transmitting interval control
+
+const int transmittInterval = 120000;  // 120000;
+unsigned long prevTransmitt = transmittInterval;
 
 // Sensor and motor driver power states
 bool motorDriverPowered = true;
 bool sensorPowered = false;
+
 
 
 bool sensorPower(bool powerState) {
@@ -37,12 +77,12 @@ bool sensorPower(bool powerState) {
   digitalWrite(loadSwitchEN, powerState);
   if (powerState == 1) {
     delayMicroseconds(400);
-    Serial.println("Sensor ON");
+    Serial.println("Soil sensor ON");
     return sensorPowered = true;
 
   } else {
     delayMicroseconds(4);
-    Serial.println("Sensor OFF");
+    Serial.println("Soil sensor OFF");
     return sensorPowered = false;
   }
 }
@@ -55,7 +95,7 @@ bool motorDriverState(bool state) {
     digitalWrite(motorDriverIN1, LOW);
     digitalWrite(motorDriverIN2, LOW);
     delay(2);  // Wait for sleep mode
-    Serial.println("Motor driver put to sleep");
+    Serial.println("Motor driver sleeping");
     return motorDriverPowered = 0;
 
   } else {
@@ -66,6 +106,64 @@ bool motorDriverState(bool state) {
     delay(50);             // Wait for wake up
     Serial.println("Motor driver powered up");
     return motorDriverPowered = 1;
+  }
+}
+
+void connectWiFi() {
+  WiFiTry = 0;
+
+  Serial.println("Starting WiFi");
+  WiFi.begin(ssid, WiFiPw);
+
+  Serial.println("Connecting to ssid: " + String(ssid));
+  while (WiFi.status() != WL_CONNECTED && WiFiTry <= maxNumberOfTries) {
+    WiFiTry++;
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (WiFiTry <= maxNumberOfTries) {
+    WiFi.setHostname(HostName);
+    Serial.println("");
+    Serial.println("WiFi connected");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    Serial.println("Signal Strength: " + String(WiFi.RSSI()) + " dBm");
+  } else {
+    Serial.println("\nERROR: WiFi could not connect");
+  }
+}
+
+void getTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) {
+    Serial.println("No time available (yet)");
+    return;
+  }
+
+  strftime(timeStr, sizeof(timeStr), "%A, %B %d %Y %H:%M:%S", &timeinfo);
+  //Serial.println(timeStr);  // Print to Serial
+}
+
+void connectMQTT() {
+  MQTTTry = 0;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  Serial.println("Connecting to MQTT");
+  MQTTclient.setServer(MQTTserver, 1883);  // 1883
+  while (!MQTTclient.connect(HostName, MQTTuser, MQTTpw) && MQTTTry <= maxNumberOfTries) {
+    MQTTTry++;
+    delay(500);
+    Serial.print(".");
+  }
+
+  if (MQTTclient.connect(HostName, MQTTuser, MQTTpw)) {
+    Serial.println("MQTT connected");
+  } else {
+    Serial.println("\nERROR: MQTT could not connect");
   }
 }
 
@@ -97,6 +195,8 @@ public:
       temperature = values[1] / 10.0f;
     } else {
       Serial.println("Failed to read humidity & temperature.");
+      humidity = -1;
+      temperature = -1;
     }
   }
 
@@ -147,7 +247,7 @@ public:
 
 
 private:
-  uint16_t calculateCRC(uint8_t *data, uint8_t length) {
+  uint16_t calculateCRC(uint8_t* data, uint8_t length) {
     uint16_t crc = 0xFFFF;
     for (uint8_t i = 0; i < length; i++) {
       crc ^= data[i];
@@ -183,7 +283,7 @@ private:
     digitalWrite(RS485_DIR, LOW);
   }
 
-  bool readModbusResponse(uint16_t *values, uint8_t expectedRegs) {
+  bool readModbusResponse(uint16_t* values, uint8_t expectedRegs) {
     uint8_t expectedBytes = 5 + expectedRegs * 2;  // Addr + Func + ByteCount + Data + CRC
     unsigned long start = millis();
     while (RS485Serial.available() < expectedBytes && millis() - start < 1000)
@@ -226,7 +326,7 @@ private:
     delayMicroseconds(100);
     digitalWrite(RS485_DIR, LOW);
 
-  
+
     delay(100);
     while (RS485Serial.available()) RS485Serial.read();  // Clear buffer
   }
@@ -234,32 +334,76 @@ private:
 
 soilSensor soilSensor;
 
+
+
 void setup() {
+  delay(2000);  // Wait for PSU to settle etc.
   Serial.begin(115200);
   while (!Serial) {
     ;
   }
+  Serial.println("Serial started \nBaud rate: " + String(Serial.baudRate()));
 
-  RS485Serial.begin(9600, SERIAL_8N1, RS485_RX, RS485_TX);
-  while (!RS485Serial) {
-    ;
-  }
-
+  Serial.print("Configuring GPIO: ");
   for (int i = 1; i <= 10; i++) {
     if (i == 8 || i == 9) continue;  // leave 8 and 9 floating
     pinMode(i, OUTPUT);
     digitalWrite(i, LOW);
+    Serial.print(i);
+    if (i == 10) {
+      Serial.println();
+      continue;  // Skip "," on the last one
+    }
+    Serial.print(", ");
   }
+  Serial.println("GPIOs configured");
 
-  sensorPower(0);
   motorDriverState(0);
+  sensorPower(0);
+
+  Serial.println("Starting RS485");
+  RS485Serial.begin(RS485_BAUD, SERIAL_8N1, RS485_RX, RS485_TX);
+  while (!RS485Serial) {
+    delay(20);
+    Serial.print(".");
+  }
+  Serial.println("RS485 Started");
 
   soilSensor.writeCalibration(0.0, 0.0);
   soilSensor.readCalData();
-  Serial.print("Humidity Calibration Value: " + String(soilSensor.humCal) + "\t");
-  Serial.print("Temperature Calibration Value: " + String(soilSensor.tempCal) + "\t");
-  Serial.print("Device Address: " + String(soilSensor.deviceAddr) + "\t");
-  Serial.println("Baud rate: " + String(soilSensor.baud));
+  Serial.println("Reading sensor");
+
+  Serial.print("Device Address: 0x");
+  int RS485DeviceAddrTempVal = soilSensor.deviceAddr;
+  Serial.println(RS485DeviceAddrTempVal, HEX);
+
+  Serial.print("Baud rate: ");
+  int RS485BaudTempVal = soilSensor.baud;
+  switch (RS485BaudTempVal) {
+    case 0: Serial.println("2400"); break;
+    case 1: Serial.println("4800"); break;
+    case 2: Serial.println("9600"); break;
+    default: Serial.println("Error/Unknown"); break;
+  }
+
+  Serial.println("Humidity Calibration Value: " + String(soilSensor.humCal));
+  Serial.println("Temperature Calibration Value: " + String(soilSensor.tempCal));
+
+  if (connectivity) {
+    Serial.println("Connectivity enabled");
+    connectWiFi();
+
+    Serial.println("Configuring time");
+    esp_sntp_servermode_dhcp(1);
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer1, ntpServer2);
+    getTime();
+    Serial.print("Time: ");
+    Serial.println(timeStr);
+
+    connectMQTT();
+  } else {
+    Serial.println("Connectivity disabled");
+  }
 
   // Blink LED indicating setup config. complete
   for (int i = 0; i < 5; i++) {
@@ -270,23 +414,54 @@ void setup() {
     digitalWrite(ledPin, LOW);
     delay(100);
   }
+
+  Serial.println("BLOOM configured!\n");
 }
 
 void loop() {
 
   soilSensor.read();
-  Serial.print("Temperature: " + String(soilSensor.temperature) + "\t");
-  Serial.println("Humidity: " + String(soilSensor.humidity));
+
+  if (connectivity) {
+
+    if (!MQTTclient.connected()) {
+      connectMQTT();  // This also calls connectWiFi();
+    }
+
+    if (millis() - prevTransmitt >= transmittInterval) {
+      int temperature = soilSensor.temperature;
+      int humidity = soilSensor.humidity;
+
+      MQTTclient.publish("BLOOM/Temperature", String(temperature).c_str());
+      Serial.print("Send temperature to MQTT: ");
+      Serial.println(temperature);
+
+      MQTTclient.publish("BLOOM/Humidity", String(humidity).c_str());
+      Serial.print("Send humidity to MQTT: ");
+      Serial.println(humidity);
+
+      getTime();
+      MQTTclient.publish("BLOOM/Time", String(timeStr).c_str());
+      Serial.print("Send time MQTT: ");
+      Serial.println(timeStr);
 
 
 
-  delay(1000);
+      prevTransmitt = millis();
+    }
+  } else {
+    Serial.println("Temperature: " + String(soilSensor.temperature));
+    Serial.println("Humidity: " + String(soilSensor.humidity));
+  }
+
+
 
   // RUN-indication (blinking LED)
-  if (millis() - prevBlink >= blinkInterval) {
-    ledState = !ledState;
-    digitalWrite(ledPin, ledState ? HIGH : LOW);
-    prevBlink = millis();
-    Serial.println("Blink");
+  if (runIndication) {
+    if (millis() - prevBlink >= blinkInterval) {
+      ledState = !ledState;
+      digitalWrite(ledPin, ledState ? HIGH : LOW);
+      prevBlink = millis();
+    }
   }
 }
