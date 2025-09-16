@@ -11,6 +11,8 @@
 #include <PubSubClient.h>
 #include <credentials.h>
 
+const bool debugSensor = false;
+
 // credentials.h
 const char* ssid = SSID;
 const char* WiFiPw = WIFI_PW;
@@ -61,14 +63,13 @@ const int blinkInterval = 1800000;
 bool ledState = false;
 
 // Transmitting interval control
-
-const int transmittInterval = 120000;  // 120000;
+const int transmittInterval = 1800000;  // 120000;
 unsigned long prevTransmitt = transmittInterval;
+
 
 // Sensor and motor driver power states
 bool motorDriverPowered = true;
 bool sensorPowered = false;
-
 
 
 bool sensorPower(bool powerState) {
@@ -141,7 +142,7 @@ void getTime() {
     return;
   }
 
-  strftime(timeStr, sizeof(timeStr), "%A, %B %d %Y %H:%M:%S", &timeinfo);
+  strftime(timeStr, sizeof(timeStr), "%d. %B %Y %H:%M:%S", &timeinfo);
   //Serial.println(timeStr);  // Print to Serial
 }
 
@@ -164,6 +165,12 @@ void connectMQTT() {
     Serial.println("MQTT connected");
   } else {
     Serial.println("\nERROR: MQTT could not connect");
+    for (int i = 0; i < 3; i++) {
+      digitalWrite(ledPin, HIGH);
+      delay(100);
+      digitalWrite(ledPin, LOW);
+      delay(200);
+    }
   }
 }
 
@@ -337,7 +344,7 @@ soilSensor soilSensor;
 
 
 void setup() {
-  delay(2000);  // Wait for PSU to settle etc.
+  delay(2000);  // Wait for PSU to settle
   Serial.begin(115200);
   while (!Serial) {
     ;
@@ -357,6 +364,7 @@ void setup() {
     Serial.print(", ");
   }
   Serial.println("GPIOs configured");
+  digitalWrite(ledPin, HIGH);
 
   motorDriverState(0);
   sensorPower(0);
@@ -420,15 +428,15 @@ void setup() {
 
 void loop() {
 
-  soilSensor.read();
+  if (millis() - prevTransmitt >= transmittInterval) {
+    if (connectivity) {
 
-  if (connectivity) {
+      if (!MQTTclient.connected()) {
+        connectMQTT();  // This also calls connectWiFi();
+      }
 
-    if (!MQTTclient.connected()) {
-      connectMQTT();  // This also calls connectWiFi();
-    }
-
-    if (millis() - prevTransmitt >= transmittInterval) {
+      digitalWrite(ledPin, HIGH);
+      soilSensor.read();
       int temperature = soilSensor.temperature;
       int humidity = soilSensor.humidity;
 
@@ -448,10 +456,13 @@ void loop() {
 
 
       prevTransmitt = millis();
+      digitalWrite(ledPin, LOW);
     }
   } else {
-    Serial.println("Temperature: " + String(soilSensor.temperature));
-    Serial.println("Humidity: " + String(soilSensor.humidity));
+    if (debugSensor) {
+      Serial.println("Temperature: " + String(soilSensor.temperature));
+      Serial.println("Humidity: " + String(soilSensor.humidity));
+    }
   }
 
 
@@ -465,3 +476,4 @@ void loop() {
     }
   }
 }
+
